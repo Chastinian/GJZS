@@ -1,10 +1,12 @@
-#!/data/data/com.termux/files/usr/bin/python
-# file Source: https://gist.github.com/ius/42bd02a5df2226633a342ab7a9c60f15
+#!/usr/bin/env python
 import struct
 import hashlib
 import bz2
 import sys
-
+import argparse
+import bsdiff4
+import io
+import os
 try:
     import lzma
 except ImportError:
@@ -31,107 +33,133 @@ def verify_contiguous(exts):
 
     return True
 
-def data_for_op(op):
-    p.seek(data_offset + op.data_offset)
-    data = p.read(op.data_length)
+def data_for_op(op,out_file,old_file):
+    args.payloadfile.seek(data_offset + op.data_offset)
+    data = args.payloadfile.read(op.data_length)
 
-    assert hashlib.sha256(data).digest() == op.data_sha256_hash, 'operation data hash mismatch'
+    # assert hashlib.sha256(data).digest() == op.data_sha256_hash, 'operation data hash mismatch'
 
     if op.type == op.REPLACE_XZ:
         dec = lzma.LZMADecompressor()
-        data = dec.decompress(data) 
+        data = dec.decompress(data)
+        out_file.seek(op.dst_extents[0].start_block*block_size)
+        out_file.write(data)
     elif op.type == op.REPLACE_BZ:
         dec = bz2.BZ2Decompressor()
-        data = dec.decompress(data) 
+        data = dec.decompress(data)
+        out_file.seek(op.dst_extents[0].start_block*block_size)
+        out_file.write(data)
+    elif op.type == op.REPLACE:
+        out_file.seek(op.dst_extents[0].start_block*block_size)
+        out_file.write(data)
+    elif op.type == op.SOURCE_COPY:
+        if not args.diff:
+            print ("SOURCE_COPY supported only for differential OTA")
+            sys.exit(-2)
+        out_file.seek(op.dst_extents[0].start_block*block_size)
+        for ext in op.src_extents:
+            old_file.seek(ext.start_block*block_size)
+            data = old_file.read(ext.num_blocks*block_size)
+            out_file.write(data)
+    elif op.type == op.SOURCE_BSDIFF:
+        if not args.diff:
+            print ("SOURCE_BSDIFF supported only for differential OTA")
+            sys.exit(-3)
+        out_file.seek(op.dst_extents[0].start_block*block_size)
+        tmp_buff = io.BytesIO()
+        for ext in op.src_extents:
+            old_file.seek(ext.start_block*block_size)
+            old_data = old_file.read(ext.num_blocks*block_size)
+            tmp_buff.write(old_data)
+        tmp_buff.seek(0)
+        old_data = tmp_buff.read()
+        tmp_buff.seek(0)
+        tmp_buff.write(bsdiff4.patch(old_data, data))
+        n = 0;
+        tmp_buff.seek(0)
+        for ext in op.dst_extents:
+            tmp_buff.seek(n*block_size)
+            n += ext.num_blocks
+            data = tmp_buff.read(ext.num_blocks*block_size)
+            out_file.seek(ext.start_block*block_size)
+            out_file.write(data)
+    elif op.type == op.ZERO:
+        for ext in op.dst_extents:
+            out_file.seek(ext.start_block*block_size)
+            out_file.write(b'\x00' * ext.num_blocks*block_size)
+    else:
+        print ("Unsupported type = %d" % op.type)
+        sys.exit(-1)
 
     return data
 
 def dump_part(part):
-    print(f"正在提取{part.partition_name}……")
+    sys.stdout.write("Processing %s partition" % part.partition_name)
+    sys.stdout.flush()
 
-    out_file = open('%s.img' % part.partition_name, 'wb')
+    out_file = open('%s/%s.img' % (args.out, part.partition_name), 'wb')
     h = hashlib.sha256()
 
+    if args.diff:
+        old_file = open('%s/%s.img' % (args.old, part.partition_name), 'rb')
+    else:
+        old_file = None
+
     for op in part.operations:
-        data = data_for_op(op)
-        h.update(data)
-        out_file.write(data)
+        data = data_for_op(op,out_file,old_file)
+        sys.stdout.write(".")
+        sys.stdout.flush()
 
-    assert h.digest() == part.new_partition_info.hash, 'partition hash mismatch'
-
-def help(file):
-    print(f"""
--h | --help打印帮助
--l 仅查看{file}镜像列表不解压
--d xxx 仅解压{file}里的指定 xxx 镜像
-无参数时就解压{file}全部镜像到当前目录
-""")
+    print("Done")
 
 
-file_name = 0
+parser = argparse.ArgumentParser(description='OTA payload dumper')
+parser.add_argument('payloadfile', type=argparse.FileType('rb'),
+                    help='payload file name')
+parser.add_argument('--out', default='output',
+                    help='output directory (defaul: output)')
+parser.add_argument('--diff',action='store_true',
+                    help='extract differential OTA, you need put original images to old dir')
+parser.add_argument('--old', default='old',
+                    help='directory with original images for differential OTA (defaul: old)')
+parser.add_argument('--images', default="",
+                    help='images to extract (default: empty)')
+args = parser.parse_args()
 
+#Check for --out directory exists
+if not os.path.exists(args.out):
+    os.makedirs(args.out)
 
-if len(sys.argv) == 4:
-    file_name = sys.argv[2] if len(sys.argv) == 4 else ""
-    file = sys.argv[3] if len(sys.argv) == 4 else ""
-elif len(sys.argv) == 3:
-    file = sys.argv[2] if len(sys.argv) == 3 else ""
-else:
-    file = sys.argv[1] if len(sys.argv) == 2 else ""
-
-if len(sys.argv) == 1:
-    help(file)
-    exit()
-elif sys.argv[1] == "-h" or sys.argv[1] == "--help":
-    help(file)
-    exit()
-elif sys.argv[1] == "-d" and len(sys.argv) != 4:
-    help(file)
-    exit()
-elif sys.argv[1] == "-l" and len(sys.argv) != 3:
-    help(file)
-    exit()
-
-
-print(f"开始解析{file}文件……\n")
-
-p = open(file, 'rb')
-
-magic = p.read(4)
+magic = args.payloadfile.read(4)
 assert magic == b'CrAU'
 
-file_format_version = u64(p.read(8))
+file_format_version = u64(args.payloadfile.read(8))
 assert file_format_version == 2
 
-manifest_size = u64(p.read(8))
+manifest_size = u64(args.payloadfile.read(8))
 
 metadata_signature_size = 0
 
 if file_format_version > 1:
-    metadata_signature_size = u32(p.read(4))
+    metadata_signature_size = u32(args.payloadfile.read(4))
 
-manifest = p.read(manifest_size)
-metadata_signature = p.read(metadata_signature_size)
+manifest = args.payloadfile.read(manifest_size)
+metadata_signature = args.payloadfile.read(metadata_signature_size)
 
-data_offset = p.tell()
+data_offset = args.payloadfile.tell()
 
 dam = um.DeltaArchiveManifest()
 dam.ParseFromString(manifest)
+block_size = dam.block_size
 
-for part in dam.partitions:
-    for op in part.operations:
-        assert op.type in (op.REPLACE, op.REPLACE_BZ, op.REPLACE_XZ), \
-                'unsupported op'
-
-    extents = flatten([op.dst_extents for op in part.operations])
-    assert verify_contiguous(extents), 'operations do not span full image'
-
-    if sys.argv[1] == "-d" and len(sys.argv) == 4:
-        if part.partition_name == file_name:
-            dump_part(part)
-    elif sys.argv[1] == "-l" and len(sys.argv) == 3:
-        print(part.partition_name)
-    elif len(sys.argv) == 2:
+if args.images == "":
+    for part in dam.partitions:
         dump_part(part)
-
-print(f"\n解析{file}文件完成。")
+else:
+    images = args.images.split(",")
+    for image in images:
+        partition = [part for part in dam.partitions if part.partition_name == image]
+        if partition:
+            dump_part(partition[0])
+        else:
+            sys.stderr.write("Partition %s not found in payload!\n" % image)
